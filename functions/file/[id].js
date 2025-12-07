@@ -4,7 +4,8 @@ export async function onRequest(context) {
 
     let fileUrl = 'https://telegra.ph/' + url.pathname + url.search;
 
-    if (url.pathname.length > 39) { // Telegram Bot API 上传的文件
+    // 判断是否是 Telegram Bot API 上传的文件（路径较长）
+    if (url.pathname.length > 39) {
         const fileId = url.pathname.split(".")[0].split("/")[2];
         const filePath = await getFilePath(env, fileId);
         if (filePath) {
@@ -12,56 +13,62 @@ export async function onRequest(context) {
         }
     }
 
-    // 原始 fetch 请求
+    // 请求文件
     const response = await fetch(fileUrl, {
         method: request.method,
         headers: request.headers,
         body: request.body,
     });
 
-    if (!response.ok) return response;
+    if (!response.ok) return fixResponse(response, request.url);
 
-    // Admin 页面直接返回原始内容
+    // Admin 页面允许直接查看
     const isAdmin = request.headers.get('Referer')?.includes(`${url.origin}/admin`);
-    if (isAdmin) return response;
+    if (isAdmin) return fixResponse(response, request.url);
 
-    // KV 存储检查和初始化
-    let record;
-    if (env.img_url) {
-        record = await env.img_url.getWithMetadata(params.id);
-        if (!record || !record.metadata) {
-            record = {
-                metadata: {
-                    ListType: "None",
-                    Label: "None",
-                    TimeStamp: Date.now(),
-                    liked: false,
-                    fileName: params.id,
-                    fileSize: 0,
-                }
-            };
-            await env.img_url.put(params.id, "", { metadata: record.metadata });
-        }
+    // KV 未初始化，直接返回文件
+    if (!env.img_url) return fixResponse(response, request.url);
+
+    // 从 KV 获取 metadata
+    let record = await env.img_url.getWithMetadata(params.id);
+    if (!record || !record.metadata) {
+        record = {
+            metadata: {
+                ListType: "None",
+                Label: "None",
+                TimeStamp: Date.now(),
+                liked: false,
+                fileName: params.id,
+                fileSize: 0,
+            }
+        };
+        await env.img_url.put(params.id, "", { metadata: record.metadata });
     }
 
-    const metadata = record?.metadata || {
-        ListType: "None",
-        Label: "None",
-        TimeStamp: Date.now(),
-        liked: false,
-        fileName: params.id,
-        fileSize: 0,
+    const metadata = {
+        ListType: record.metadata.ListType || "None",
+        Label: record.metadata.Label || "None",
+        TimeStamp: record.metadata.TimeStamp || Date.now(),
+        liked: record.metadata.liked !== undefined ? record.metadata.liked : false,
+        fileName: record.metadata.fileName || params.id,
+        fileSize: record.metadata.fileSize || 0,
     };
 
-    // 白名单/屏蔽逻辑
+    // 白名单：直接显示
     if (metadata.ListType === "White") {
-        return modifyResponse(response);
-    } else if (metadata.ListType === "Block" || metadata.Label === "adult") {
+        return fixResponse(response, request.url);
+    }
+
+    // 黑名单 / 成人内容 → 拦截
+    if (metadata.ListType === "Block" || metadata.Label === "adult") {
         const referer = request.headers.get('Referer');
-        const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
+        const redirectUrl = referer
+            ? "https://static-res.pages.dev/teleimage/img-block-compressed.png"
+            : `${url.origin}/block-img.html`;
         return Response.redirect(redirectUrl, 302);
     }
 
+    // 白名单模式开启 → 不允许公开访问
     if (env.WhiteList_Mode === "true") {
         return Response.redirect(`${url.origin}/whitelist-on.html`, 302);
     }
@@ -82,49 +89,72 @@ export async function onRequest(context) {
                 }
             }
         } catch (error) {
-            console.error("Content moderation error:", error.message);
+            console.error("Moderation error:", error.message);
         }
     }
 
     // 保存 metadata
-    if (env.img_url) {
-        await env.img_url.put(params.id, "", { metadata });
-    }
+    await env.img_url.put(params.id, "", { metadata });
 
-    // 返回响应，并根据类型设置 Content-Disposition
-    return modifyResponse(response);
+    // 最终返回响应，区分显示 / 下载
+    return fixResponse(response, request.url);
 }
 
-// 将 response 修改为 inline 或 attachment
-async function modifyResponse(response) {
-    const contentType = response.headers.get("Content-Type") || "application/octet-stream";
+
+// -------------------------
+// 根据文件类型判断是否 inline（直接显示）还是 attachment（下载）
+// -------------------------
+function fixResponse(originalResponse, requestUrl) {
+    const newHeaders = new Headers(originalResponse.headers);
+
+    const contentType = originalResponse.headers.get("Content-Type") || "application/octet-stream";
+
+    // 根据扩展名 + MIME 类型判断
+    const inlineExts = ['jpg','jpeg','png','gif','webp','bmp','tiff','mp4','webm','mov','mkv','avi','mp3','wav','ogg','m4a'];
+    const pathname = new URL(requestUrl).pathname.toLowerCase();
+
     let disposition = "attachment"; // 默认下载
-    if (contentType.startsWith("image/") || contentType.startsWith("video/") || contentType.startsWith("audio/")) {
-        disposition = "inline"; // 直接显示
+
+    // 扩展名判断
+    for (const ext of inlineExts) {
+        if (pathname.endsWith('.' + ext)) {
+            disposition = "inline";
+            break;
+        }
     }
 
-    const modifiedHeaders = new Headers(response.headers);
-    modifiedHeaders.set("Content-Disposition", disposition);
+    // MIME 类型判断
+    if (disposition !== "inline" && (contentType.startsWith("image/") || contentType.startsWith("video/") || contentType.startsWith("audio/"))) {
+        disposition = "inline";
+    }
 
-    const body = await response.arrayBuffer();
-    return new Response(body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: modifiedHeaders
+    newHeaders.set("Content-Disposition", disposition);
+
+    // 修复 Telegram 有时返回的错误 Content-Type
+    if (disposition === "inline" && !contentType.startsWith("image/") && !contentType.startsWith("video/") && !contentType.startsWith("audio/")) {
+        newHeaders.set("Content-Type", "application/octet-stream");
+    }
+
+    return new Response(originalResponse.body, {
+        status: originalResponse.status,
+        statusText: originalResponse.statusText,
+        headers: newHeaders
     });
 }
 
+
+// -------------------------
 // 获取 Telegram 文件路径
+// -------------------------
 async function getFilePath(env, file_id) {
     try {
-        const res = await fetch(`https://api.telegram.org/bot${env.TG_Bot_Token}/getFile?file_id=${file_id}`);
+        const res = await fetch(`https://api.telegram.org/bot${env.TG_Bot_Token}/getFile?file_id=${file_id}`, { method: 'GET' });
         if (!res.ok) return null;
         const data = await res.json();
         if (data.ok && data.result) return data.result.file_path;
         return null;
     } catch (error) {
-        console.error('getFilePath error:', error.message);
+        console.error("getFilePath error:", error.message);
         return null;
     }
 }
-
