@@ -4,7 +4,7 @@ export async function onRequest(context) {
 
     let fileUrl = 'https://telegra.ph/' + url.pathname + url.search;
 
-    // 如果是 Telegram Bot API 上传的文件（路径较长）
+    // 判断是否是 Telegram Bot API 上传的文件
     if (url.pathname.length > 39) {
         const fileId = url.pathname.split(".")[0].split("/")[2];
         const filePath = await getFilePath(env, fileId);
@@ -96,16 +96,19 @@ export async function onRequest(context) {
     // 保存 metadata
     await env.img_url.put(params.id, "", { metadata });
 
-    // 返回图片，图片 inline，其他文件保持默认行为（浏览器决定下载）
+    // 最终返回，图片直接显示，其他文件按浏览器默认
     return fixImageResponse(response);
 }
 
 
-// 处理图片直接显示
+// -------------------------
+// 图片直接显示，其它文件保持浏览器默认
+// -------------------------
 function fixImageResponse(originalResponse) {
     const newHeaders = new Headers(originalResponse.headers);
     const contentType = originalResponse.headers.get("Content-Type") || "";
 
+    // 仅图片设置 inline
     if (contentType.startsWith("image/")) {
         newHeaders.set("Content-Disposition", "inline");
     }
@@ -133,4 +136,3 @@ async function getFilePath(env, file_id) {
         return null;
     }
 }
-
