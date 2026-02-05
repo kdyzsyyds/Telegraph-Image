@@ -24,10 +24,10 @@ export async function onRequest(context) {
 
     // Admin 页面允许直接查看
     const isAdmin = request.headers.get('Referer')?.includes(`${url.origin}/admin`);
-    if (isAdmin) return forceImageInline(response, fileUrl);
+    if (isAdmin) return forceMediaInline(response, fileUrl);
 
-    // KV 未初始化，直接返回文件
-    if (!env.img_url) return forceImageInline(response, fileUrl);
+    // KV 未初始化，直接返回文件（但也尝试按图片/视频 inline）
+    if (!env.img_url) return forceMediaInline(response, fileUrl);
 
     // 获取 KV metadata
     let record = await env.img_url.getWithMetadata(params.id);
@@ -56,7 +56,7 @@ export async function onRequest(context) {
 
     // 白名单直接显示
     if (metadata.ListType === "White") {
-        return forceImageInline(response, fileUrl);
+        return forceMediaInline(response, fileUrl);
     }
 
     // 黑名单 / 成人内容 → 拦截
@@ -96,30 +96,59 @@ export async function onRequest(context) {
     // 保存 metadata
     await env.img_url.put(params.id, "", { metadata });
 
-    // 强制图片 inline 返回
-    return forceImageInline(response, fileUrl);
+    // 强制图片/视频 inline 返回（其它类型保持原样，让浏览器决定）
+    return forceMediaInline(response, fileUrl);
 }
 
 
 // -------------------------
-// 强制图片显示，其他文件默认浏览器处理
+// 强制图片/视频显示，其他文件默认浏览器处理
 // -------------------------
-function forceImageInline(originalResponse, fileUrl) {
+function forceMediaInline(originalResponse, fileUrl) {
     const newHeaders = new Headers(originalResponse.headers);
 
-    // 根据文件后缀判断是否图片
+    // 先尝试通过 URL 后缀判断类型
     const lower = fileUrl.toLowerCase();
-    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) newHeaders.set("Content-Type", "image/jpeg");
-    else if (lower.endsWith(".png")) newHeaders.set("Content-Type", "image/png");
-    else if (lower.endsWith(".gif")) newHeaders.set("Content-Type", "image/gif");
-    else if (lower.endsWith(".webp")) newHeaders.set("Content-Type", "image/webp");
-    else if (lower.endsWith(".bmp")) newHeaders.set("Content-Type", "image/bmp");
+    let determinedContentType = null;
 
-    // 只针对图片强制 inline
-    if (newHeaders.get("Content-Type")?.startsWith("image/")) {
-        newHeaders.set("Content-Disposition", "inline");
+    // 图片类型
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) determinedContentType = "image/jpeg";
+    else if (lower.endsWith(".png")) determinedContentType = "image/png";
+    else if (lower.endsWith(".gif")) determinedContentType = "image/gif";
+    else if (lower.endsWith(".webp")) determinedContentType = "image/webp";
+    else if (lower.endsWith(".bmp")) determinedContentType = "image/bmp";
+    else if (lower.endsWith(".svg")) determinedContentType = "image/svg+xml";
+
+    // 常见视频类型
+    else if (lower.endsWith(".mp4")) determinedContentType = "video/mp4";
+    else if (lower.endsWith(".webm")) determinedContentType = "video/webm";
+    else if (lower.endsWith(".ogv") || lower.endsWith(".ogg")) determinedContentType = "video/ogg";
+    else if (lower.endsWith(".mov")) determinedContentType = "video/quicktime";
+    else if (lower.endsWith(".mkv")) determinedContentType = "video/x-matroska";
+    else if (lower.endsWith(".flv")) determinedContentType = "video/x-flv";
+    else if (lower.endsWith(".ts")) determinedContentType = "video/mp2t";
+
+    // 如果 URL 后缀无法判断，则回退使用原始响应头的 Content-Type（如果有）
+    if (!determinedContentType) {
+        const originCT = originalResponse.headers.get("Content-Type");
+        if (originCT) {
+            // 只接受 image/ 或 video/ 类型作为 inline 判定依据
+            if (originCT.startsWith("image/") || originCT.startsWith("video/")) {
+                determinedContentType = originCT.split(";")[0]; // 去掉 charset 等参数
+            }
+        }
     }
 
+    // 如果确定是 image/ 或 video/，则设置 Content-Type 并强制 inline
+    if (determinedContentType) {
+        newHeaders.set("Content-Type", determinedContentType);
+
+        if (determinedContentType.startsWith("image/") || determinedContentType.startsWith("video/")) {
+            newHeaders.set("Content-Disposition", "inline");
+        }
+    }
+
+    // 返回新的 Response，保留原始状态码和 body（支持 Range 等）
     return new Response(originalResponse.body, {
         status: originalResponse.status,
         statusText: originalResponse.statusText,
